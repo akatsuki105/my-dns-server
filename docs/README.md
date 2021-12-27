@@ -13,4 +13,4 @@ DNSを深く理解すること、Rustを使って何か面白いことをする�
 - [Chapter 1 - DNSプロトコル](chapter1.md)
 - [Chapter 2 - スタブリゾルバを作ろう](chapter2.md)
 - [Chapter 3 - 新しいレコードタイプをサポートしよう](chapter3.md)
-
+- [Chapter 4 - DNSサーバの構築](chapter4.md)
