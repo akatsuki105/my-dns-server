@@ -215,44 +215,42 @@ impl DnsPacket {
 
 ```rust
 fn main() -> Result<()> {
-    // Perform an A query for google.com
+    // google.comについてのAクエリを実行します。
     let qname = "google.com";
     let qtype = QueryType::A;
 
-    // Using googles public DNS server
+    // DNSサーバとしてGoogleのDNSサーバーを使います。
     let server = ("8.8.8.8", 53);
 
-    // Bind a UDP socket to an arbitrary port
+    // 適当なポート(今回はポート43210を使用)に対してUDPソケットをバインドします。
     let socket = UdpSocket::bind(("0.0.0.0", 43210))?;
 
-    // Build our query packet. It's important that we remember to set the
-    // `recursion_desired` flag. As noted earlier, the packet id is arbitrary.
+    // クエリパケットを構築します。
+    // ここで重要なのは、`recursion_desired`フラグを忘れずに設定することです。
     let mut packet = DnsPacket::new();
-
-    packet.header.id = 6666;
+    packet.header.id = 6666;                                            // 先に述べたように、パケットIDは任意のものです。
     packet.header.questions = 1;
-    packet.header.recursion_desired = true;
-    packet
-        .questions
-        .push(DnsQuestion::new(qname.to_string(), qtype));
+    packet.header.recursion_desired = true;                             // サーバーに再帰処理をリクエスト
+    packet.questions.push(DnsQuestion::new(qname.to_string(), qtype));
 
-    // Use our new write method to write the packet to a buffer...
+    // バッファ。これをUDPで送る
     let mut req_buffer = BytePacketBuffer::new();
+
+    // 新しく定義したwriteメソッドでパケットの内容をバッファに書き込む
     packet.write(&mut req_buffer)?;
 
-    // ...and send it off to the server using our socket:
+    // バッファをUDPソケットで送る
     socket.send_to(&req_buffer.buf[0..req_buffer.pos], server)?;
 
-    // To prepare for receiving the response, we'll create a new `BytePacketBuffer`,
-    // and ask the socket to write the response directly into our buffer.
+    // レスポンスを受信するための準備として、新しい`BytePacketBuffer`を作成し、ソケットにレスポンスを直接バッファに書き込むように指示します。
     let mut res_buffer = BytePacketBuffer::new();
     socket.recv_from(&mut res_buffer.buf)?;
 
-    // As per the previous section, `DnsPacket::from_buffer()` is then used to
-    // actually parse the packet after which we can print the response.
+    // 前のセクションで述べたように、`DnsPacket::from_buffer()`は、実際にパケットを解析するために使用され、その後、レスポンスをプリントすることができます。
     let res_packet = DnsPacket::from_buffer(&mut res_buffer)?;
-    println!("{:#?}", res_packet.header);
 
+    // ヘッダ、クエスチョン、各レコードを出力
+    println!("{:#?}", res_packet.header);
     for q in res_packet.questions {
         println!("{:#?}", q);
     }
