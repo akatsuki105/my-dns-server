@@ -1,6 +1,5 @@
-use std::fs::File;
-use std::io::Read;
 use std::net::Ipv4Addr;
+use std::net::UdpSocket;
 
 type Error = Box<dyn std::error::Error>;
 type Result<T> = std::result::Result<T, Error>;
@@ -137,6 +136,56 @@ impl BytePacketBuffer {
 
         Ok(())
     }
+
+    fn write(&mut self, val: u8) -> Result<()> {
+        if self.pos >= 512 {
+            return Err("End of buffer".into());
+        }
+
+        self.buf[self.pos] = val;
+        self.pos += 1;
+        Ok(())
+    }
+
+    fn write_u8(&mut self, val: u8) -> Result<()> {
+        self.write(val)?;
+
+        Ok(())
+    }
+
+    fn write_u16(&mut self, val: u16) -> Result<()> {
+        self.write((val >> 8) as u8)?;
+        self.write((val & 0xFF) as u8)?;
+
+        Ok(())
+    }
+
+    fn write_u32(&mut self, val: u32) -> Result<()> {
+        self.write(((val >> 24) & 0xFF) as u8)?;
+        self.write(((val >> 16) & 0xFF) as u8)?;
+        self.write(((val >> 8) & 0xFF) as u8)?;
+        self.write(((val >> 0) & 0xFF) as u8)?;
+
+        Ok(())
+    }
+
+    fn write_qname(&mut self, qname: &str) -> Result<()> {
+        for label in qname.split('.') {
+            let len = label.len();
+            if len > 0x3f {
+                return Err("Single label exceeds 63 characters of length".into());
+            }
+
+            self.write_u8(len as u8)?;
+            for b in label.as_bytes() {
+                self.write_u8(*b as u8)?;
+            }
+        }
+
+        self.write_u8(0)?; // terminate character
+
+        Ok(())
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -233,6 +282,33 @@ impl DnsHeader {
 
         Ok(())
     }
+
+    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<()> {
+        buffer.write_u16(self.id)?;
+
+        buffer.write_u8(
+            (self.recursion_desired as u8)
+                | ((self.truncated_message as u8) << 1)
+                | ((self.authoritative_answer as u8) << 2)
+                | ((self.opcode as u8) << 3)
+                | ((self.response as u8) << 7),
+        )?;
+
+        buffer.write_u8(
+            (self.rescode as u8)
+                | ((self.checking_disabled as u8) << 4)
+                | ((self.authed_data as u8) << 5)
+                | ((self.z as u8) << 6)
+                | ((self.recursion_available as u8) << 7),
+        )?;
+
+        buffer.write_u16(self.questions)?;
+        buffer.write_u16(self.answers)?;
+        buffer.write_u16(self.authoritative_entries)?;
+        buffer.write_u16(self.resource_entries)?;
+
+        Ok(())
+    }
 }
 
 #[derive(PartialEq, Eq, Debug, Clone, Hash, Copy)]
@@ -272,6 +348,17 @@ impl DnsQuestion {
         buffer.read_qname(&mut self.name)?;
         self.qtype = QueryType::from_num(buffer.read_u16()?);
         let _ = buffer.read_u16()?; // read class
+
+        Ok(())
+    }
+
+    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<()> {
+        buffer.write_qname(&self.name)?;
+
+        let typenum = self.qtype.to_num();
+        buffer.write_u16(typenum)?;
+
+        buffer.write_u16(1)?; // class
 
         Ok(())
     }
@@ -320,7 +407,7 @@ impl DnsRecord {
             QueryType::UNKNOWN(_) => {
                 // skip record
 
-                buffer.step(data_len as usize);
+                buffer.step(data_len as usize)?;
                 Ok(DnsRecord::UNKNOWN {
                     domain,
                     qtype: qtype_num,
@@ -329,6 +416,37 @@ impl DnsRecord {
                 })
             }
         }
+    }
+
+    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<usize> {
+        let start_pos = buffer.pos();
+
+        match *self {
+            DnsRecord::A {
+                ref domain,
+                ref addr,
+                ttl,
+            } => {
+                // Preamble
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::A.to_num())?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(ttl)?;
+                buffer.write_u16(4)?;
+
+                // IP addr
+                let octets = addr.octets();
+                buffer.write_u8(octets[0])?;
+                buffer.write_u8(octets[1])?;
+                buffer.write_u8(octets[2])?;
+                buffer.write_u8(octets[3])?;
+            }
+            DnsRecord::UNKNOWN { .. } => {
+                println!("Skipping record: {:?}", self);
+            }
+        }
+
+        Ok(buffer.pos() - start_pos)
     }
 }
 
@@ -377,26 +495,76 @@ impl DnsPacket {
 
         Ok(result)
     }
+
+    pub fn write(&mut self, buffer: &mut BytePacketBuffer) -> Result<()> {
+        self.header.questions = self.questions.len() as u16;
+        self.header.answers = self.answers.len() as u16;
+        self.header.authoritative_entries = self.authorities.len() as u16;
+        self.header.resource_entries = self.resources.len() as u16;
+
+        self.header.write(buffer)?;
+
+        for question in &self.questions {
+            question.write(buffer)?;
+        }
+        for rec in &self.answers {
+            rec.write(buffer)?;
+        }
+        for rec in &self.authorities {
+            rec.write(buffer)?;
+        }
+        for rec in &self.resources {
+            rec.write(buffer)?;
+        }
+
+        Ok(())
+    }
 }
 
 fn main() {
-    let mut f = File::open("response_packet.txt").unwrap();
-    let mut buffer = BytePacketBuffer::new();
-    f.read(&mut buffer.buf).unwrap();
+    // google.comについてのAクエリを実行します。
+    let qname = "google.com";
+    let qtype = QueryType::A;
 
-    let packet = DnsPacket::from_buffer(&mut buffer).unwrap();
-    println!("{:#?}", packet.header);
+    // DNSサーバとしてGoogleのDNSサーバーを使います。
+    let server = ("8.8.8.8", 53);
 
-    for q in packet.questions {
+    let socket = UdpSocket::bind(("0.0.0.0", 43210)).unwrap();
+
+    // パケットの情報を人間にわかりやすい形で持っておく(これを後でバイト列に変換して送信)
+    let mut packet = DnsPacket::new();
+    packet.header.id = 6666;
+    packet.header.questions = 1;
+    packet.header.recursion_desired = true;
+    packet
+        .questions
+        .push(DnsQuestion::new(qname.to_string(), qtype));
+
+    let mut req_buffer = BytePacketBuffer::new();
+
+    packet.write(&mut req_buffer).unwrap();
+
+    socket
+        .send_to(&req_buffer.buf[0..req_buffer.pos], server)
+        .unwrap();
+
+    let mut res_buffer = BytePacketBuffer::new();
+    socket.recv_from(&mut res_buffer.buf).unwrap();
+
+    let res_packet = DnsPacket::from_buffer(&mut res_buffer).unwrap();
+
+    // ヘッダ、クエスチョン、各レコードを出力
+    println!("{:#?}", res_packet.header);
+    for q in res_packet.questions {
         println!("{:#?}", q);
     }
-    for rec in packet.answers {
+    for rec in res_packet.answers {
         println!("{:#?}", rec);
     }
-    for rec in packet.authorities {
+    for rec in res_packet.authorities {
         println!("{:#?}", rec);
     }
-    for rec in packet.resources {
+    for rec in res_packet.resources {
         println!("{:#?}", rec);
     }
 }
