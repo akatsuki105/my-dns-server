@@ -1,5 +1,5 @@
-use std::net::Ipv4Addr;
 use std::net::UdpSocket;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 type Error = Box<dyn std::error::Error>;
 type Result<T> = std::result::Result<T, Error>;
@@ -186,6 +186,19 @@ impl BytePacketBuffer {
 
         Ok(())
     }
+
+    fn set(&mut self, pos: usize, val: u8) -> Result<()> {
+        self.buf[pos] = val;
+
+        Ok(())
+    }
+
+    fn set_u16(&mut self, pos: usize, val: u16) -> Result<()> {
+        self.set(pos, (val >> 8) as u8)?;
+        self.set(pos + 1, (val & 0xFF) as u8)?;
+
+        Ok(())
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -315,6 +328,10 @@ impl DnsHeader {
 pub enum QueryType {
     UNKNOWN(u16),
     A, // 1
+    NS,
+    CNAME,
+    MX,
+    AAAA,
 }
 
 impl QueryType {
@@ -322,12 +339,20 @@ impl QueryType {
         match *self {
             QueryType::UNKNOWN(x) => x,
             QueryType::A => 1,
+            QueryType::NS => 2,
+            QueryType::CNAME => 5,
+            QueryType::MX => 15,
+            QueryType::AAAA => 28,
         }
     }
 
     pub fn from_num(num: u16) -> Self {
         match num {
             1 => QueryType::A,
+            2 => QueryType::NS,
+            5 => QueryType::CNAME,
+            15 => QueryType::MX,
+            28 => QueryType::AAAA,
             _ => QueryType::UNKNOWN(num),
         }
     }
@@ -378,6 +403,27 @@ pub enum DnsRecord {
         addr: Ipv4Addr,
         ttl: u32,
     }, // 1
+    NS {
+        domain: String,
+        host: String,
+        ttl: u32,
+    }, // 2
+    CNAME {
+        domain: String,
+        host: String,
+        ttl: u32,
+    }, // 5
+    MX {
+        domain: String,
+        priority: u16,
+        host: String,
+        ttl: u32,
+    }, // 15
+    AAAA {
+        domain: String,
+        addr: Ipv6Addr,
+        ttl: u32,
+    }, // 28
 }
 
 impl DnsRecord {
@@ -392,7 +438,9 @@ impl DnsRecord {
         let ttl = buffer.read_u32()?;
         let data_len = buffer.read_u16()?;
 
+        // プリアンブル以降をクエリタイプに応じてパースする
         match qtype {
+            // IPアドレス(v4)を読み取る
             QueryType::A => {
                 let raw_addr = buffer.read_u32()?;
                 let addr = Ipv4Addr::new(
@@ -404,6 +452,70 @@ impl DnsRecord {
 
                 Ok(DnsRecord::A { domain, addr, ttl })
             }
+
+            // IPアドレス(v6)を読み取る
+            QueryType::AAAA => {
+                let raw_addr1 = buffer.read_u32()?;
+                let raw_addr2 = buffer.read_u32()?;
+                let raw_addr3 = buffer.read_u32()?;
+                let raw_addr4 = buffer.read_u32()?;
+                let addr = Ipv6Addr::new(
+                    ((raw_addr1 >> 16) & 0xFFFF) as u16,
+                    ((raw_addr1 >> 0) & 0xFFFF) as u16,
+                    ((raw_addr2 >> 16) & 0xFFFF) as u16,
+                    ((raw_addr2 >> 0) & 0xFFFF) as u16,
+                    ((raw_addr3 >> 16) & 0xFFFF) as u16,
+                    ((raw_addr3 >> 0) & 0xFFFF) as u16,
+                    ((raw_addr4 >> 16) & 0xFFFF) as u16,
+                    ((raw_addr4 >> 0) & 0xFFFF) as u16,
+                );
+
+                Ok(DnsRecord::AAAA {
+                    domain: domain,
+                    addr: addr,
+                    ttl: ttl,
+                })
+            }
+
+            // ドメインに対応する権威サーバーを返す
+            QueryType::NS => {
+                let mut ns = String::new();
+                buffer.read_qname(&mut ns)?;
+
+                Ok(DnsRecord::NS {
+                    domain: domain,
+                    host: ns,
+                    ttl: ttl,
+                })
+            }
+
+            // エイリアスのドメインを返す
+            QueryType::CNAME => {
+                let mut cname = String::new();
+                buffer.read_qname(&mut cname)?;
+
+                Ok(DnsRecord::CNAME {
+                    domain: domain,
+                    host: cname,
+                    ttl: ttl,
+                })
+            }
+
+            // ドメインに対応するメールサーバーのホストを返す
+            QueryType::MX => {
+                let priority = buffer.read_u16()?;
+                let mut mx = String::new();
+                buffer.read_qname(&mut mx)?;
+
+                Ok(DnsRecord::MX {
+                    domain: domain,
+                    priority: priority,
+                    host: mx,
+                    ttl: ttl,
+                })
+            }
+
+            // UNKNOWNを返す
             QueryType::UNKNOWN(_) => {
                 // skip record
 
@@ -418,6 +530,7 @@ impl DnsRecord {
         }
     }
 
+    // buffer にこの構造体がもつDNSレコードの内容を書き込む
     pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<usize> {
         let start_pos = buffer.pos();
 
@@ -427,20 +540,110 @@ impl DnsRecord {
                 ref addr,
                 ttl,
             } => {
-                // Preamble
+                // プリアンブル
                 buffer.write_qname(domain)?;
                 buffer.write_u16(QueryType::A.to_num())?;
                 buffer.write_u16(1)?;
                 buffer.write_u32(ttl)?;
                 buffer.write_u16(4)?;
 
-                // IP addr
+                // IPアドレス(v4)
                 let octets = addr.octets();
                 buffer.write_u8(octets[0])?;
                 buffer.write_u8(octets[1])?;
                 buffer.write_u8(octets[2])?;
                 buffer.write_u8(octets[3])?;
             }
+
+            DnsRecord::NS {
+                ref domain,
+                ref host,
+                ttl,
+            } => {
+                // プリアンブル
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::NS.to_num())?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(ttl)?;
+
+                // プリアンブルの長さ部分は不定
+                let pos = buffer.pos();
+                buffer.write_u16(0)?;
+
+                // ラベル
+                buffer.write_qname(host)?;
+
+                let size = buffer.pos() - (pos + 2);
+                buffer.set_u16(pos, size as u16)?;
+            }
+
+            DnsRecord::CNAME {
+                ref domain,
+                ref host,
+                ttl,
+            } => {
+                // プリアンブル
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::CNAME.to_num())?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(ttl)?;
+
+                // プリアンブルの長さ部分は不定
+                let pos = buffer.pos();
+                buffer.write_u16(0)?;
+
+                // ラベル
+                buffer.write_qname(host)?;
+
+                let size = buffer.pos() - (pos + 2);
+                buffer.set_u16(pos, size as u16)?;
+            }
+
+            DnsRecord::MX {
+                ref domain,
+                priority,
+                ref host,
+                ttl,
+            } => {
+                // プリアンブル
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::MX.to_num())?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(ttl)?;
+
+                // プリアンブルの長さ部分は不定
+                let pos = buffer.pos();
+                buffer.write_u16(0)?;
+
+                // 優先度(2バイト)
+                buffer.write_u16(priority)?;
+
+                // ラベル
+                buffer.write_qname(host)?;
+
+                let size = buffer.pos() - (pos + 2);
+                buffer.set_u16(pos, size as u16)?;
+            }
+
+            DnsRecord::AAAA {
+                ref domain,
+                ref addr,
+                ttl,
+            } => {
+                // プリアンブル
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::AAAA.to_num())?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(ttl)?;
+                buffer.write_u16(16)?;
+
+                // IPアドレス(v6)
+                let octets = addr.segments();
+                for octet in &octets {
+                    buffer.write_u16(*octet)?;
+                }
+            }
+
             DnsRecord::UNKNOWN { .. } => {
                 println!("Skipping record: {:?}", self);
             }
@@ -523,8 +726,8 @@ impl DnsPacket {
 
 fn main() {
     // google.comについてのAクエリを実行します。
-    let qname = "google.com";
-    let qtype = QueryType::A;
+    let qname = "www.yahoo.com";
+    let qtype = QueryType::MX;
 
     // DNSサーバとしてGoogleのDNSサーバーを使います。
     let server = ("8.8.8.8", 53);

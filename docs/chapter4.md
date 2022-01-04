@@ -154,8 +154,7 @@ fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
 ```rust
 /// Handle a single incoming packet
 fn handle_query(socket: &UdpSocket) -> Result<()> {
-    // With a socket ready, we can go ahead and read a packet. This will
-    // block until one is received.
+    // ソケットの準備ができたら、さっそくパケットを読んでみましょう。これは受信するまでブロックされます。
     let mut req_buffer = BytePacketBuffer::new();
 
     // The `recv_from` function will write the data into the provided buffer,
