@@ -2,18 +2,20 @@
 
 ここまで来たら、いよいよ実際のサーバーを作ってみましょう。実際のDNSサーバーには2つの種類があります。
 
-- **権威サーバ**: 1つまたは複数の「ゾーン」をホストするDNSサーバーです。例えば、google.comというゾーンの権限を持つサーバーは、ns1.google.com、ns2.google.com、ns3.google.com、ns4.google.comとなります。
+- **権威サーバ**: 1つまたは複数のゾーンを管理するDNSサーバーです。例えば、`google.com`というゾーンの権限を持つサーバーは、`ns1.google.com`、`ns2.google.com`、`ns3.google.com`、`ns4.google.com`となります。
 - **キャッシュサーバ**: DNSサーバーは、要求されたレコードをすでに知っているかどうかを確認するためにキャッシュをチェックし、知らない場合は再帰検索を行ってレコードを見つけ出すことで、DNSルックアップを処理します。これには、ホームルーターで稼動しているDNSサーバー、ISPがDHCPで割り当てているDNSサーバー、GoogleのパブリックDNSサーバー`8.8.8.8`と`8.8.4.4`が含まれます。
 
-1つのサーバーが両方の役割を果たすことは技術的には可能ですが、実際にはこの2つの役割は相互に排他的であることが一般的です。
+> ゾーン: 自分の管理する範囲内の情報。例えば、権威サーバのns1.google.comが持っている、google.comについての情報(IPアドレスなど)
+
+1つのサーバーが両方の役割を果たすことは技術的には可能ですが、実際にはこの2つの役割は別々のサーバで行われることが一般的です。
 
 これは、パケットヘッダの`RD`(Recursion Desired)と`RA`(Recursion Available)というフラグの意味も説明しています。
 
 スタブリゾルバがキャッシュサーバに問い合わせをすると、RDフラグがセットされ、サーバはそのようなクエリを許可しているので、ルックアップを実行してRAフラグをセットした応答を送信します。
 
-これは権威サーバでは機能しません。権威サーバはホストされているゾーンに関連するクエリにのみ応答しますので、RDフラグがセットされているクエリにはエラーレスポンスを送信します。
+これは権威サーバでは機能しません。権威サーバは管理しているゾーンに関連するクエリにのみ応答しますので、RDフラグがセットされているクエリにはエラーレスポンスを送信します。
 
-実際に検証してみましょう。まず、`8.8.8.8`を使って`yahoo.com`を調べてみましょう。
+実際に検証してみましょう。まず、`8.8.8.8`(キャッシュサーバ)を使って`yahoo.com`を調べてみましょう。
 
 ```sh
 $ dig @8.8.8.8 yahoo.com
@@ -41,7 +43,7 @@ yahoo.com.		1051	IN	A	206.190.36.45
 ;; MSG SIZE  rcvd: 86
 ```
 
-これは期待通りの動作です。次に、同じクエリを`google.com`ゾーンをホストしているサーバーの1つに送信してみましょう。
+これは期待通りの動作です。次に、同じクエリを`google.com`ゾーンを管理しているサーバ(権威サーバ)の1つに送信してみましょう。
 
 ```sh
 $ dig @ns1.google.com yahoo.com
@@ -90,7 +92,9 @@ google.com.		300	IN	A	216.58.211.142
 ;; MSG SIZE  rcvd: 44
 ```
 
-今回はエラーはありません。しかし、`dig`はまだ再帰機能が利用できないことを警告しています。しかし、`+norecurse`を使って明示的に再帰性の設定を解除すれば、警告は消えます。
+今回は権威サーバのゾーンに対してのクエリなのでエラーはありません。
+
+しかし、`dig`はまだ再帰機能が利用できないことを警告しています。この場合、`+norecurse`を使って明示的に再帰性の設定を解除すれば、警告は消えます。
 
 ```sh
 $ dig +norecurse @ns1.google.com google.com
@@ -116,11 +120,14 @@ google.com.		300	IN	A	216.58.211.142
 
 この最後のクエリは、キャッシュサーバが名前を再帰的に解決する際に送信することが期待されるタイプのクエリです。
 
-独自のサーバを書く最初の試みとして、クエリを別のキャッシュサーバ、つまり「DNSプロキシサーバ」に転送するだけのサーバを実装することで、よりシンプルなものにします。難しい作業のほとんどはすでに終わっているので、むしろすぐにできる作業です。
+独自のサーバを書く最初の試みとして、クエリを別のキャッシュサーバ、つまり「DNSプロキシサーバ」に転送するだけのサーバを実装することで、よりシンプルなものにします。
 
-## Separating lookup into a separate function
+今までの章で、難しい作業のほとんどはすでに終わっているので、むしろすぐにできる作業です。
+
+## ルックアップの処理を別の関数に切り出す
 
 ```rust
+/// キャッシュサーバに問い合わせを行う
 fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
     // Forward queries to Google's public DNS
     let server = ("8.8.8.8", 53);
@@ -147,43 +154,40 @@ fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
 }
 ```
 
-## Implementing our first server
+## サーバを実装しよう
 
 それでは、サーバーのコードを書きましょう。まず、いくつかの項目を整理する必要があります。
 
 ```rust
-/// Handle a single incoming packet
+/// やってきたパケットを1つを処理(クエリを見て、レスポンスを返す)します
 fn handle_query(socket: &UdpSocket) -> Result<()> {
-    // ソケットの準備ができたら、さっそくパケットを読んでみましょう。これは受信するまでブロックされます。
+    // ソケットの準備ができたら、さっそくやってきたパケットを読み込んでみましょう。
+
+    // まずパケットを読み込むためのバッファを作成します
     let mut req_buffer = BytePacketBuffer::new();
 
-    // The `recv_from` function will write the data into the provided buffer,
-    // and return the length of the data read as well as the source address.
-    // We're not interested in the length, but we need to keep track of the
-    // source in order to send our reply later on.
+    // 関数`recv_from`は、提供されたバッファにデータを書き込みます。そして，読み込んだデータの長さと送信元アドレスを返します。
+    // 今回は長さには興味がありませんが、後で返信を送るためには送信元アドレスを保存しておく必要があります。
     let (_, src) = socket.recv_from(&mut req_buffer.buf)?;
 
-    // Next, `DnsPacket::from_buffer` is used to parse the raw bytes into
-    // a `DnsPacket`.
+    // バッファの内容を読み取って、高レベルな構造体`DnsPacket`を生成する
     let mut request = DnsPacket::from_buffer(&mut req_buffer)?;
 
-    // Create and initialize the response packet
+    // レスポンスとして送るパケットを作成、初期化します
     let mut packet = DnsPacket::new();
     packet.header.id = request.header.id;
     packet.header.recursion_desired = true;
     packet.header.recursion_available = true;
     packet.header.response = true;
 
-    // In the normal case, exactly one question is present
+    // 通常のケースでは、ちょうど1つのクエスチョンがクエリパケットに存在します。
     if let Some(question) = request.questions.pop() {
         println!("Received query: {:?}", question);
 
-        // Since all is set up and as expected, the query can be forwarded to the
-        // target server. There's always the possibility that the query will
-        // fail, in which case the `SERVFAIL` response code is set to indicate
-        // as much to the client. If rather everything goes as planned, the
-        // question and response records as copied into our response packet.
-        if let Ok(result) = lookup(&question.name, question.qtype) {
+        // 全てのセットアップが完了し、期待通りの結果が得られれば、クエリをターゲットサーバに転送することができます。
+        // クエリが失敗する可能性もありますが、その場合にはクライアントにその旨を伝えるために`SERVFAIL`というレスポンスコードが設定されます。
+        // 逆に、すべてが計画通りに進んだ場合は、クエスチョンとレスポンスのレコードがレスポンスパケットにコピーされます。
+        if let Ok(result) = lookup(&question.name, question.qtype) { // Googleのキャッシュサーバにクエリを転送
             packet.questions.push(question);
             packet.header.rescode = result.header.rescode;
 
@@ -203,14 +207,12 @@ fn handle_query(socket: &UdpSocket) -> Result<()> {
             packet.header.rescode = ResultCode::SERVFAIL;
         }
     }
-    // Being mindful of how unreliable input data from arbitrary senders can be, we
-    // need make sure that a question is actually present. If not, we return `FORMERR`
-    // to indicate that the sender made something wrong.
+    // 任意の送信者からの入力データが信頼できない可能性があることを念頭に置き、クエスチョンが実際に存在するかどうかを確認する必要があります。もしそうでなければ、送信者が何か間違っていることを示すために `FORMERR` を返します。
     else {
         packet.header.rescode = ResultCode::FORMERR;
     }
 
-    // The only thing remaining is to encode our response and send it off!
+    // あとはレスポンスをエンコードして送信するだけです。
     let mut res_buffer = BytePacketBuffer::new();
     packet.write(&mut res_buffer)?;
 
@@ -236,7 +238,7 @@ fn main() -> Result<()> {
 }
 ```
 
-エラー処理のためのmatchイディオムがここで何度も使われていますが、これはリクエストループの終了を何としても避けたいからです。
+エラー処理のための`match`イディオムがここで何度も使われていますが、これはリクエストループの終了を何としても避けたいからです。
 
 これは少し冗長で、通常は代わりに`try!`を使用したいところです。残念ながら、ここでは`Result`を返さない`main`関数の中にいるため、この方法は使えません。
 
@@ -268,7 +270,7 @@ google.com.		68	IN	A	216.58.211.142
 
 サーバーを起動したターミナルを見ると、出力は次のようになります。
 
-```
+```sh
 Received query: DnsQuestion { name: "google.com", qtype: A }
 Answer: A { domain: "google.com", addr: 216.58.211.142, ttl: 96 }
 ```
